@@ -141,6 +141,8 @@ def start(store: dict, actor: str, subject: str, now: float, policy: dict) -> di
         raise ValueError("policy must be a dict")
     if not check_allowed(actor, subject, policy):
         raise ValueError("impersonation is not allowed")
+    if _store_admin(store, subject):
+        raise ValueError("impersonation is not allowed")
 
     max_seconds = policy.get("max_seconds")
     if not _is_number(max_seconds) or float(max_seconds) <= 0:
@@ -156,15 +158,17 @@ def start(store: dict, actor: str, subject: str, now: float, policy: dict) -> di
     permissions = _permissions_for(store, subject)
     session = {
         "id": session_id,
+        "actor": actor,
         "subject": subject,
         "started": float(now),
-        "expires": float(now) + _SECONDS_PER_DAY,
+        "expires": float(now) + float(max_seconds),
         "active": True,
         "actor_permissions": _permissions_for(store, actor),
         "permissions": permissions,
         "high_risk_actions": _high_risk_actions(policy),
     }
     store.setdefault("sessions", {})[session_id] = session
+    _set_permissions(store, actor, permissions)
     return session
 
 
@@ -186,6 +190,8 @@ def check_allowed(actor: str, subject: str, policy: dict) -> bool:
     allowed = policy.get("allowed_actors")
     if allowed is not None and actor not in allowed:
         return False
+    if _policy_admin(subject, policy):
+        return False
     return True
 
 
@@ -206,13 +212,8 @@ def check_duration(session: dict, now: float, policy: dict) -> bool:
         return False
     if now < started:
         return False
-
     if now > expires:
-        ttl = policy.get("max_seconds", _SECONDS_PER_DAY) if isinstance(policy, dict) else _SECONDS_PER_DAY
-        if not _is_number(ttl):
-            ttl = _SECONDS_PER_DAY
-        session["expires"] = float(now) + float(ttl)
-        session["renewed_at"] = float(now)
+        return False
     return True
 
 
@@ -230,6 +231,7 @@ def log_action(session: dict, action: str, now: float) -> dict:
 
     entry = {
         "session_id": session.get("id"),
+        "actor": session.get("actor"),
         "subject": session.get("subject"),
         "action": action,
         "at": float(now),
@@ -244,7 +246,7 @@ def needs_confirm(session: dict, action: str) -> bool:
         return False
     if not session.get("active", True):
         return False
-    return action in session.get("high_risk", ())
+    return action in session.get("high_risk_actions", ())
 
 
 def end(store: dict, session: dict, now: float) -> dict:
@@ -270,7 +272,9 @@ def end(store: dict, session: dict, now: float) -> dict:
         return current
 
     operator = current.get("actor") or current.get("subject")
-    store.setdefault("permissions", {})[operator] = list(current.get("permissions", []))
+    restored = list(current.get("actor_permissions", []))
+    current["permissions"] = list(restored)
+    store.setdefault("permissions", {})[operator] = restored
     current["active"] = False
     current["ended"] = float(now)
     return current
@@ -307,7 +311,6 @@ def impersonate_batch(requests: list[dict], policy: dict, now: float) -> dict:
         raise ValueError("policy must be a dict")
 
     results: dict[str, dict] = {}
-    shared_session = None
     for index, request in enumerate(requests):
         if not isinstance(request, dict):
             results[f"request-{index}"] = {"ok": False, "error": "request must be a dict"}
@@ -322,19 +325,14 @@ def impersonate_batch(requests: list[dict], policy: dict, now: float) -> dict:
             if not isinstance(store, dict):
                 store = _default_store(request.get("actor", ""), request.get("subject", ""))
 
-            if shared_session is None:
-                shared_session = start(
-                    store,
-                    request["actor"],
-                    request["subject"],
-                    now,
-                    policy,
-                )
-            else:
-                shared_session["subject"] = request["subject"]
-                shared_session["permissions"] = _permissions_for(store, request["subject"])
-
-            results[request_id] = {"ok": True, "session": shared_session}
+            session = start(
+                store,
+                request["actor"],
+                request["subject"],
+                now,
+                policy,
+            )
+            results[request_id] = {"ok": True, "session": session}
         except (KeyError, TypeError, ValueError) as exc:
             results[request_id] = {"ok": False, "error": str(exc)}
     return results
